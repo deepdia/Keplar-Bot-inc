@@ -1,0 +1,472 @@
+{
+  "name": "wa---bot",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@distube/ytdl-core": "^4.16.12",
+    "express": "^5.2.1",
+    "play-dl": "^1.9.7",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.3",
+    "whatsapp-web.js": "^1.34.7",
+    "youtube-ext": "^1.1.25",
+    "yt-search": "^2.13.1"
+  }
+}
+```[cite: 7]
+
+---
+
+### ২. `config/database.json`
+```json
+{
+    "users": {}
+}
+```[cite: 6]
+
+---
+
+### ৩. `src/services/youtubeService.js`
+```javascript
+const play = require('play-dl');
+const { MessageMedia } = require('whatsapp-web.js');
+
+class YoutubeService {
+    static async getAudio(query) {
+        try {
+            const searchResults = await play.search(query, { limit: 5 });
+            const video = searchResults.find(v => v.durationInSec < 600);
+
+            if (!video) {
+                console.log('❌ No short video found (under 10 mins).');
+                return null;
+            }
+
+            console.log(`🎵 Found Video: ${video.title} (Duration: ${video.durationRaw})`);
+            const stream = await play.stream(video.url);
+            
+            const buffer = await new Promise((resolve, reject) => {
+                const chunks = [];
+                stream.stream.on('data', (chunk) => chunks.push(chunk));
+                stream.stream.on('end', () => resolve(Buffer.concat(chunks)));
+                stream.stream.on('error', (err) => reject(err));
+            });
+
+            return new MessageMedia('audio/mp4', buffer.toString('base64'), `${video.title}.mp3`);
+        } catch (error) {
+            console.error('❌ Download Error:', error);
+            return null;
+        }
+    }
+}
+
+module.exports = YoutubeService;
+```[cite: 9]
+
+---
+
+### ৪. `src/handlers/antiLinkHandler.js`
+```javascript
+class AntiLinkHandler {
+    constructor() {
+        this.userStrikes = {};
+    }
+
+    async handle(message, chat, groupConfig, isAdmin, isBotAdmin, senderId) {
+        if (!groupConfig.antilink || isAdmin) return false;
+
+        const linkRegex = /(https?:\/\/[^\s]+|www\.[^\s]+|wa\.me\S+|[a-zA-Z0-9-]+\.(com|in|net|org|link)\b)/gi;
+        
+        if (linkRegex.test(message.body)) {
+            if (!isBotAdmin) {
+                await message.reply('⚠️ আমাকে গ্রুপের অ্যাডমিন না করলে আমি লিংক ডিলিট বা মেম্বার রিমুভ করতে পারব না!');
+                return true;
+            }
+
+            try {
+                const groupId = chat.id._serialized;
+                if (!this.userStrikes[groupId]) this.userStrikes[groupId] = {};
+                if (!this.userStrikes[groupId][senderId]) this.userStrikes[groupId][senderId] = 0;
+                
+                this.userStrikes[groupId][senderId] += 1;
+                const strikeCount = this.userStrikes[groupId][senderId];
+
+                await message.delete(true); 
+                
+                if (strikeCount >= 3) {
+                    await chat.removeParticipants([senderId]);
+                    await chat.sendMessage(`🛑 @${senderId.split('@')[0]} কে গ্রুপ থেকে রিমুভ করা হয়েছে (৩ বার লিংক শেয়ার করার জন্য)!`, { mentions: [senderId] });
+                    this.userStrikes[groupId][senderId] = 0; 
+                } else {
+                    await chat.sendMessage(`⚠️ @${senderId.split('@')[0]}, এই গ্রুপে লিংক শেয়ার করা নিষেধ!\n\n*সতর্কবার্তা:* ${strikeCount}/3\n(৩ বার লিংক দিলে আপনাকে গ্রুপ থেকে রিমুভ করা হবে!)`, { mentions: [senderId] });
+                }
+            } catch (error) {
+                console.log("❌ Delete/Kick Error:", error);
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+module.exports = new AntiLinkHandler();
+```[cite: 1]
+
+---
+
+### ৫. `src/handlers/antiSpamHandler.js`
+```javascript
+class AntiSpamHandler {
+    constructor() {
+        this.userSpamTracker = {};
+    }
+
+    async handle(message, chat, groupConfig, isAdmin, isBotAdmin, senderId) {
+        if (!groupConfig.antispam || isAdmin) return false;
+
+        const now = Date.now();
+        if (!this.userSpamTracker[senderId]) this.userSpamTracker[senderId] = [];
+        
+        this.userSpamTracker[senderId].push(now);
+        this.userSpamTracker[senderId] = this.userSpamTracker[senderId].filter(time => now - time < 5000);
+        
+        if (this.userSpamTracker[senderId].length > 4) { 
+            if (isBotAdmin) {
+                await message.delete(true);
+                await chat.sendMessage(`🛑 @${senderId.split('@')[0]}, দয়া করে স্প্যামিং (Spamming) করা বন্ধ করুন!`, { mentions: [senderId] });
+            }
+            return true;
+        }
+        return false;
+    }
+}
+
+module.exports = new AntiSpamHandler();
+```[cite: 2]
+
+---
+
+### ৬. `src/controllers/messageController.js`
+```javascript
+const fs = require('fs');
+const path = require('path');
+const { MessageMedia } = require('whatsapp-web.js');
+const antiLinkHandler = require('../handlers/antiLinkHandler');
+const antiSpamHandler = require('../handlers/antiSpamHandler');
+const youtubeService = require('../services/youtubeService');
+
+class MessageController {
+    static async handle(message, userId, client) {
+        const dbPath = path.join(__dirname, '../../config/database.json');
+        if (!fs.existsSync(dbPath)) return;
+
+        let db = JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+        const userConfig = db.users[userId];
+        if (!userConfig) return; 
+        if (!userConfig.groups) userConfig.groups = {};
+
+        const prefix = userConfig.prefix || '!';
+        const msg = message.body.toLowerCase().trim();
+        const chat = await message.getChat();
+
+        if (chat.isGroup) {
+            const groupId = chat.id._serialized;
+            const senderId = message.fromMe ? client.info.wid._serialized : (message.author || message.from);
+            const botId = client.info.wid._serialized;
+            
+            const senderNumber = senderId.split('@')[0];
+            const botNumber = botId.split('@')[0];
+
+            if (!userConfig.groups[groupId]) {
+                userConfig.groups[groupId] = { antilink: false, antispam: false };
+            }
+            const groupConfig = userConfig.groups[groupId];
+            
+            let isAdmin = message.fromMe; 
+            let isBotAdmin = false;
+
+            if (chat.participants) {
+                const senderData = chat.participants.find(p => p.id.user === senderNumber || p.id._serialized === senderId);
+                const botData = chat.participants.find(p => p.id.user === botNumber || p.id._serialized === botId);
+                
+                if (senderData) isAdmin = isAdmin || senderData.isAdmin || senderData.isSuperAdmin;
+                if (botData) isBotAdmin = botData.isAdmin || botData.isSuperAdmin;
+            }
+
+            if (await antiLinkHandler.handle(message, chat, groupConfig, isAdmin, isBotAdmin, senderId)) return;
+            if (await antiSpamHandler.handle(message, chat, groupConfig, isAdmin, isBotAdmin, senderId)) return; 
+
+            if (msg === prefix + 'menu' || msg === prefix + 'settings') {
+                if (!isAdmin) {
+                    await message.reply('❌ শুধুমাত্র গ্রুপের অ্যাডমিনরা এই মেনু দেখতে পারবেন।');
+                    return;
+                }
+                let menuText = `⚙️ *KEPLAR WORLD ENTERPRISE MENU*\n\n`;
+                menuText += `1️⃣ *Anti-Link*: ${groupConfig.antilink ? '✅ ON' : '❌ OFF'}\n`;
+                menuText += `2️⃣ *Anti-Spam*: ${groupConfig.antispam ? '✅ ON' : '❌ OFF'}\n\n`;
+                menuText += `👉 *${prefix}antilink on/off*\n👉 *${prefix}antispam on/off*\n\n`;
+                menuText += `_অ্যাডমিন কমান্ড_:\n👉 ` + `del` + ` (রিপ্লাই দিয়ে)\n👉 ` + prefix + `kick` + ` (রিপ্লাই বা মেনশন দিয়ে)`;
+                await message.reply(menuText);
+                return;
+            }
+
+            if (isAdmin) {
+                let updated = false;
+                if (msg === prefix + 'antilink on') { groupConfig.antilink = true; updated = true; }
+                else if (msg === prefix + 'antilink off') { groupConfig.antilink = false; updated = true; }
+                else if (msg === prefix + 'antispam on') { groupConfig.antispam = true; updated = true; }
+                else if (msg === prefix + 'antispam off') { groupConfig.antispam = false; updated = true; }
+
+                if (updated) {
+                    fs.writeFileSync(dbPath, JSON.stringify(db, null, 4));
+                    await message.reply('✅ সিকিউরিটি কনফিগারেশন আপডেট করা হয়েছে!');
+                    return;
+                }
+
+                if (msg === 'del' || msg === prefix + 'del') {
+                    if (!isBotAdmin) {
+                        await message.reply('⚠️ আমাকে গ্রুপের অ্যাডমিন না করলে আমি মেসেজ ডিলিট করতে পারব না!');
+                        return;
+                    }
+                    if (message.hasQuotedMsg) {
+                        const quotedMsg = await message.getQuotedMessage();
+                        try {
+                            await quotedMsg.delete(true); 
+                            await message.delete(true);   
+                        } catch (error) {
+                            console.log("Delete Error:", error);
+                        }
+                    } else {
+                        await message.reply('⚠️ যে মেসেজটি ডিলিট করতে চান তাতে রিপ্লাই দিয়ে `del` লিখুন!');
+                    }
+                    return;
+                }
+
+                if (msg.startsWith(prefix + 'kick') || msg.startsWith('kick')) {
+                    if (!isBotAdmin) {
+                        await message.reply('⚠️ আমাকে গ্রুপের অ্যাডমিন না করলে আমি মেম্বার রিমুভ করতে পারব না!');
+                        return;
+                    }
+
+                    let targetIds = [];
+                    if (message.hasQuotedMsg) {
+                        const quotedMsg = await message.getQuotedMessage();
+                        targetIds.push(quotedMsg.author || quotedMsg.from);
+                    }
+                    if (message.mentionedIds && message.mentionedIds.length > 0) {
+                        targetIds = targetIds.concat(message.mentionedIds);
+                    }
+
+                    if (targetIds.length > 0) {
+                        try {
+                            await chat.removeParticipants(targetIds);
+                            await message.reply('✅ সফলভাবে মেম্বার রিমুভ করা হয়েছে!');
+                        } catch (error) {
+                            console.log("Kick Error:", error);
+                        }
+                    } else {
+                        await message.reply('⚠️ যাকে রিমুভ করতে চান তার মেসেজে রিপ্লাই দিয়ে বা মেনশন করে কমান্ড দিন!');
+                    }
+                    return;
+                }
+            }
+        }
+
+        if (msg.startsWith(`${prefix}play `)) {
+            const query = message.body.slice(prefix.length + 5).trim();
+            if (!query) {
+                await message.reply(`❌ গানের নাম দিন। উদাহরণ: ${prefix}play Song Name`);
+                return;
+            }
+
+            await message.reply(`🎵 "${query}" প্রসেসিং চলছে...`);
+            const media = await youtubeService.getAudio(query);
+            
+            if (!media) {
+                await message.reply('❌ কাঙ্ক্ষিত অডিওটি পাওয়া যায়নি।');
+                return;
+            }
+
+            await client.sendMessage(message.from, media, { sendAudioAsVoice: false });
+            return;
+        }
+
+        for (let item of userConfig.replies) {
+            const expectedTrigger = item.usePrefix ? (prefix + item.trigger.toLowerCase()) : item.trigger.toLowerCase();
+            if (msg === expectedTrigger) {
+                if (item.mediaData) {
+                    const media = new MessageMedia(item.mimeType, item.mediaData, item.fileName || 'media');
+                    await client.sendMessage(message.from, media, { caption: item.reply });
+                } else {
+                    await message.reply(item.reply);
+                }
+                break; 
+            }
+        }
+    }
+}
+
+module.exports = MessageController;
+```[cite: 4]
+
+---
+
+### ৭. `src/bots/whatsappManager.js`
+```javascript
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode');
+const messageController = require('../controllers/messageController');
+
+class WhatsappManager {
+    constructor() {
+        this.clients = {};
+    }
+
+    startBot(socket, choice, phone, userId) {
+        if (this.clients[userId]) {
+            socket.emit('bot_ready');
+            return;
+        }
+
+        const client = new Client({
+            authStrategy: new LocalAuth({ clientId: userId }), 
+            puppeteer: {
+                headless: true,
+                args: ['--no-sandbox', '--disable-setuid-sandbox']
+            },
+            webVersionCache: { type: 'none' }
+        });
+
+        this.clients[userId] = client;
+
+        client.on('qr', async (qr) => {
+            if (choice === '1') {
+                qrcode.toDataURL(qr, (err, url) => {
+                    if (!err) socket.emit('qr_code', url);
+                });
+            } else if (choice === '2' && phone) {
+                try {
+                    const pairingCode = await client.requestPairingCode(phone);
+                    socket.emit('pairing_code', pairingCode);
+                } catch (err) {
+                    console.error('Pairing Code Error:', err);
+                }
+            }
+        });
+
+        client.on('ready', () => {
+            socket.emit('bot_ready');
+            console.log(`✅ Enterprise Bot Live for User: ${userId}`);
+        });
+
+        client.on('message_create', async message => {
+            await messageController.handle(message, userId, client); 
+        });
+
+        client.initialize();
+    }
+
+    async stopBot(socket, userId) {
+        if (this.clients[userId]) {
+            await this.clients[userId].destroy();
+            delete this.clients[userId];
+            console.log(`🛑 Bot Terminated for User: ${userId}`);
+            if (socket) socket.emit('bot_stopped');
+        }
+    }
+}
+
+module.exports = new WhatsappManager();
+```[cite: 3]
+
+---
+
+### ৮. `index.js`
+```javascript
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
+const fs = require('fs');
+const path = require('path');
+const whatsappManager = require('./src/bots/whatsappManager');
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+const dbPath = path.join(__dirname, 'config/database.json');
+
+if (!fs.existsSync(path.dirname(dbPath))) {
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
+}
+if (!fs.existsSync(dbPath)) {
+    fs.writeFileSync(dbPath, JSON.stringify({ users: {} }, null, 4));
+}
+
+function readDB() {
+    try {
+        return JSON.parse(fs.readFileSync(dbPath, 'utf8'));
+    } catch (error) {
+        return { users: {} };
+    }
+}
+
+app.use(express.static('public'));
+
+io.on('connection', (socket) => {
+    socket.on('register_user', (data) => {
+        let db = readDB();
+        if (db.users[data.username]) {
+            socket.emit('auth_error', 'Username already exists!');
+        } else {
+            db.users[data.username] = { password: data.password, prefix: '!', replies: [] };
+            fs.writeFileSync(dbPath, JSON.stringify(db, null, 4));
+            socket.emit('register_success', 'Account created successfully!');
+        }
+    });
+
+    socket.on('login_user', (data) => {
+        let db = readDB();
+        if (db.users[data.username] && db.users[data.username].password === data.password) {
+            socket.emit('login_success', data.username);
+        } else {
+            socket.emit('auth_error', 'Invalid credentials!');
+        }
+    });
+
+    socket.on('start_bot', (data) => {
+        whatsappManager.startBot(socket, data.choice, data.phone, data.userId);
+    });
+
+    socket.on('stop_bot', async (userId) => {
+        await whatsappManager.stopBot(socket, userId);
+    });
+
+    socket.on('get_config', (userId) => {
+        let db = readDB();
+        if (db.users[userId]) socket.emit('config_data', db.users[userId]);
+    });
+
+    socket.on('save_config', (data) => {
+        let db = readDB();
+        if (db.users[data.userId]) {
+            db.users[data.userId].prefix = data.config.prefix;
+            db.users[data.userId].replies = data.config.replies;
+            fs.writeFileSync(dbPath, JSON.stringify(db, null, 4));
+            socket.emit('config_saved');
+        }
+    });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`🚀 Advanced Enterprise Server Running on http://localhost:${PORT}`);
+});
+```[cite: 6]
